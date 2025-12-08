@@ -197,5 +197,4 @@ Ce TP valide les compétences essentielles du BTS SIO SISR :
 - Automatisation PowerShell  
 - Déploiement complet d'une infrastructure Windows Server  
 
-Une base solide pour un oral ou un projet professionnel.
 
