@@ -1,0 +1,505 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+  
+  # ========================================
+  # Configuration globale WinRM
+  # ========================================
+  config.vm.communicator = "winrm"
+  config.winrm.username = "vagrant"
+  config.winrm.password = "vagrant"
+  config.winrm.transport = :plaintext
+  config.winrm.basic_auth_only = true
+  config.winrm.timeout = 3600
+  config.winrm.retry_limit = 200
+  config.winrm.retry_delay = 10
+  config.vm.boot_timeout = 1800
+  config.vm.guest = :windows
+  config.windows.halt_timeout = 30
+  config.vm.graceful_halt_timeout = 30
+  
+  # Désactiver les dossiers partagés par défaut
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  
+  # Configuration réseau commun
+  NETWORK = "192.168.100"
+  DOMAIN = "mediaschool.local"
+  ADMIN_PASSWORD = "TPSaidWindows1!"
+  
+  # ========================================
+  # SRV-DC1 - Contrôleur de domaine
+  # AD DS / DNS / DHCP
+  # ========================================
+  config.vm.define "srv-dc1", primary: true do |dc|
+    # Box plus stable et fiable pour Vagrant
+    dc.vm.box = "StefanScherer/windows_2022"
+    dc.vm.hostname = "SRV-DC1"
+    
+    # Configuration réseau
+    dc.vm.network "private_network", ip: "#{NETWORK}.10", netmask: "255.255.255.0"
+    
+    # Configuration VirtualBox
+    dc.vm.provider "virtualbox" do |vb|
+      vb.name = "SRV-DC1"
+      vb.memory = 4096
+      vb.cpus = 2
+      vb.gui = true
+      vb.linked_clone = true
+      vb.customize ["modifyvm", :id, "--vram", "128"]
+      vb.customize ["modifyvm", :id, "--clipboard", "bidirectional"]
+      vb.customize ["modifyvm", :id, "--draganddrop", "bidirectional"]
+    end
+    
+    # Provisioning 1 - Attendre que Windows soit prêt
+    dc.vm.provision "shell", name: "wait-for-windows", inline: <<-SHELL
+      Write-Host "Attente de la disponibilité complète de Windows..." -ForegroundColor Yellow
+      Start-Sleep -Seconds 30
+      
+      # Vérifier que PowerShell fonctionne
+      $PSVersionTable | Out-Null
+      Write-Host "Windows est prêt!" -ForegroundColor Green
+    SHELL
+    
+    # Provisioning 2 - Configuration réseau de base
+    dc.vm.provision "shell", name: "configure-network", inline: <<-SHELL
+      Write-Host "=== Configuration réseau ===" -ForegroundColor Cyan
+      
+      # Désactiver le pare-feu
+      Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+      Write-Host "Pare-feu désactivé" -ForegroundColor Green
+      
+      # Renommer la carte réseau
+      $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+      if ($adapter) {
+        Rename-NetAdapter -Name $adapter.Name -NewName "LAN" -ErrorAction SilentlyContinue
+        Write-Host "Carte réseau renommée en LAN" -ForegroundColor Green
+      }
+      
+      # Désactiver IPv6
+      Disable-NetAdapterBinding -Name "LAN" -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+      
+      # Créer le dossier scripts
+      New-Item -Path "C:\scripts" -ItemType Directory -Force | Out-Null
+      Write-Host "Dossier C:\scripts créé" -ForegroundColor Green
+    SHELL
+    
+    # Provisioning 3 - Copie des scripts
+    dc.vm.provision "file", source: "./scripts/etape1.ps1", destination: "C:/scripts/etape1.ps1"
+    dc.vm.provision "file", source: "./scripts/etape2.ps1", destination: "C:/scripts/etape2.ps1"
+    dc.vm.provision "file", source: "./scripts/dhcp.ps1", destination: "C:/scripts/dhcp.ps1"
+    dc.vm.provision "file", source: "./scripts/horloge.ps1", destination: "C:/scripts/horloge.ps1"
+    dc.vm.provision "file", source: "./scripts/gpo.ps1", destination: "C:/scripts/gpo.ps1"
+    
+    # Provisioning 4 - Installation AD/DNS/DHCP (étape1)
+    dc.vm.provision "shell", name: "install-adds", privileged: true, inline: <<-SHELL
+      Write-Host "`n========================================" -ForegroundColor Magenta
+      Write-Host "  INSTALLATION AD DS / DNS / DHCP" -ForegroundColor Magenta
+      Write-Host "========================================`n" -ForegroundColor Magenta
+      
+      if (Test-Path "C:/scripts/etape1.ps1") {
+        try {
+          Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+          & "C:/scripts/etape1.ps1"
+          Write-Host "`nÉtape 1 terminée avec succès!" -ForegroundColor Green
+        } catch {
+          Write-Host "Erreur lors de l'exécution d'etape1.ps1: $_" -ForegroundColor Red
+          throw
+        }
+      } else {
+        Write-Host "ERREUR: Le fichier C:/scripts/etape1.ps1 n'existe pas!" -ForegroundColor Red
+        throw "Script manquant"
+      }
+    SHELL
+    
+    # Provisioning 5 - Redémarrage après promotion
+    dc.vm.provision "shell", name: "reboot-after-promotion", inline: <<-SHELL
+      Write-Host "`nRedémarrage du serveur après promotion AD..." -ForegroundColor Yellow
+      shutdown /r /t 10 /c "Redémarrage après promotion AD DS"
+    SHELL
+    dc.vm.provision "shell", name: "wait-after-reboot", inline: "Start-Sleep -Seconds 60", run: "never"
+    
+    # Provisioning 6 - Configuration post-redémarrage
+    dc.vm.provision "shell", name: "configure-ad-structure", privileged: true, inline: <<-SHELL
+      Write-Host "`n========================================" -ForegroundColor Magenta
+      Write-Host "  CONFIGURATION STRUCTURE AD" -ForegroundColor Magenta
+      Write-Host "========================================`n" -ForegroundColor Magenta
+      
+      # Attendre que AD soit complètement opérationnel
+      Start-Sleep -Seconds 30
+      
+      # Vérifier que le service AD est en cours d'exécution
+      $maxAttempts = 10
+      $attempt = 0
+      while ($attempt -lt $maxAttempts) {
+        try {
+          Import-Module ActiveDirectory -ErrorAction Stop
+          Get-ADDomain | Out-Null
+          Write-Host "Active Directory est opérationnel!" -ForegroundColor Green
+          break
+        } catch {
+          $attempt++
+          Write-Host "Tentative $attempt/$maxAttempts - Attente d'Active Directory..." -ForegroundColor Yellow
+          Start-Sleep -Seconds 10
+        }
+      }
+      
+      # Configurer DNS en premier
+      Write-Host "`nConfiguration DNS..." -ForegroundColor Cyan
+      Set-DnsClientServerAddress -InterfaceAlias "LAN" -ServerAddresses ("127.0.0.1")
+      
+      # Exécuter les scripts de configuration
+      $scripts = @("etape2.ps1", "dhcp.ps1", "horloge.ps1", "gpo.ps1")
+      foreach ($script in $scripts) {
+        $scriptPath = "C:/scripts/$script"
+        if (Test-Path $scriptPath) {
+          Write-Host "`nExécution de $script..." -ForegroundColor Cyan
+          try {
+            & $scriptPath
+            Write-Host "$script terminé avec succès!" -ForegroundColor Green
+          } catch {
+            Write-Host "Erreur lors de l'exécution de $script : $_" -ForegroundColor Red
+          }
+        } else {
+          Write-Host "ATTENTION: $scriptPath introuvable" -ForegroundColor Yellow
+        }
+      }
+      
+      Write-Host "`n========================================" -ForegroundColor Green
+      Write-Host "  SRV-DC1 CONFIGURATION TERMINÉE" -ForegroundColor Green
+      Write-Host "========================================`n" -ForegroundColor Green
+      Write-Host "Domaine: #{DOMAIN}" -ForegroundColor Cyan
+      Write-Host "IP: #{NETWORK}.10" -ForegroundColor Cyan
+      Write-Host "Services: AD DS, DNS, DHCP" -ForegroundColor Cyan
+    SHELL
+  end
+
+  # ========================================
+  # SRV-FS1 - Serveur de fichiers
+  # FSRM / WSUS / WDS / MDT
+  # ========================================
+  config.vm.define "srv-fs1", autostart: false do |fs|
+    # Box plus stable et fiable pour Vagrant
+    fs.vm.box = "StefanScherer/windows_2022"
+    fs.vm.hostname = "SRV-FS1"
+    
+    # Configuration réseau
+    fs.vm.network "private_network", ip: "#{NETWORK}.20", netmask: "255.255.255.0"
+    
+       # Configuration VirtualBox
+    fs.vm.provider "virtualbox" do |vb|
+      vb.name = "SRV-FS1"
+      vb.memory = 4096
+      vb.cpus = 2
+      vb.gui = true
+      vb.linked_clone = true
+      vb.customize ["modifyvm", :id, "--vram", "128"]
+
+      # Disque de données (dans le dossier du projet)
+      disk_file = File.join(Dir.pwd, "srv-fs1-data.vdi")
+
+      # Crée le disque seulement s'il n'existe pas
+      unless File.exist?(disk_file)
+        vb.customize ["createhd", "--filename", disk_file, "--size", 20480, "--format", "VDI"]
+      end
+
+      # Contrôleur SATA (PAS SCSI)
+      vb.customize ["storagectl", :id,
+                    "--name", "VAGRANT-SATA",
+                    "--add", "sata",
+                    "--controller", "IntelAhci",
+                    "--portcount", 2,
+                    "--bootable", "on"] rescue nil
+
+      # Attacher le disque (si déjà attaché, on ignore l'erreur)
+      vb.customize ["storageattach", :id,
+                    "--storagectl", "VAGRANT-SATA",
+                    "--port", 1,
+                    "--device", 0,
+                    "--type", "hdd",
+                    "--medium", disk_file] rescue nil
+    end
+
+    
+    # Provisioning 1 - Attendre que Windows soit prêt
+    fs.vm.provision "shell", name: "wait-for-windows", inline: <<-SHELL
+      Write-Host "Attente de la disponibilité complète de Windows..." -ForegroundColor Yellow
+      Start-Sleep -Seconds 30
+      Write-Host "Windows est prêt!" -ForegroundColor Green
+    SHELL
+    
+    # Provisioning 2 - Configuration réseau et disque
+    fs.vm.provision "shell", name: "configure-network-disk", inline: <<-SHELL
+      Write-Host "=== Configuration réseau et disque ===" -ForegroundColor Cyan
+      
+      # Désactiver le pare-feu
+      Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+      
+      # Renommer la carte réseau
+      $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+      if ($adapter) {
+        Rename-NetAdapter -Name $adapter.Name -NewName "LAN" -ErrorAction SilentlyContinue
+      }
+      
+      # Configuration DNS vers DC1
+      Set-DnsClientServerAddress -InterfaceAlias "LAN" -ServerAddresses ("#{NETWORK}.10")
+      
+      # Désactiver IPv6
+      Disable-NetAdapterBinding -Name "LAN" -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+      
+      # Initialisation du disque de données
+      Write-Host "Initialisation du disque de données..." -ForegroundColor Cyan
+      $disk = Get-Disk | Where-Object {$_.PartitionStyle -eq 'RAW'} | Select-Object -First 1
+      if ($disk) {
+        try {
+          Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru | 
+            New-Partition -DriveLetter D -UseMaximumSize | 
+            Format-Volume -FileSystem NTFS -NewFileSystemLabel "Donnees" -Confirm:$false
+          Write-Host "Disque D: créé et formaté" -ForegroundColor Green
+        } catch {
+          Write-Host "Impossible de créer le disque D:, utilisation du disque C:" -ForegroundColor Yellow
+          # Créer sur C: si D: n'est pas disponible
+          New-Item -Path "C:\Donnees" -ItemType Directory -Force | Out-Null
+          New-Item -Path "C:\Donnees\Homes" -ItemType Directory -Force | Out-Null
+          New-Item -Path "C:\WSUS" -ItemType Directory -Force | Out-Null
+          New-Item -Path "C:\DeploymentShare" -ItemType Directory -Force | Out-Null
+          Write-Host "Structure créée sur C:" -ForegroundColor Green
+        }
+      } else {
+        # Pas de disque supplémentaire, utiliser C:
+        Write-Host "Aucun disque supplémentaire détecté, utilisation du disque C:" -ForegroundColor Yellow
+        New-Item -Path "C:\Donnees" -ItemType Directory -Force | Out-Null
+        New-Item -Path "C:\Donnees\Homes" -ItemType Directory -Force | Out-Null
+        New-Item -Path "C:\WSUS" -ItemType Directory -Force | Out-Null
+        New-Item -Path "C:\DeploymentShare" -ItemType Directory -Force | Out-Null
+      }
+      
+      # Choix du disque pour les données
+$basePath = if (Test-Path -LiteralPath "D:\") { "D:\" } else { "C:\" }
+
+# Construction robuste des chemins
+$folders = @(
+  (Join-Path $basePath "Donnees"),
+  (Join-Path $basePath "Donnees\Homes"),
+  (Join-Path $basePath "WSUS"),
+  (Join-Path $basePath "DeploymentShare")
+) | Where-Object { $_ -and $_.Trim() -ne "" }
+
+foreach ($folder in $folders) {
+  if (-not (Test-Path -LiteralPath $folder)) {
+    New-Item -Path $folder -ItemType Directory -Force | Out-Null
+  }
+}
+
+Write-Host "Structure de dossiers créée sur $basePath" -ForegroundColor Green
+
+      
+      # Créer le dossier scripts
+      New-Item -Path "C:\scripts" -ItemType Directory -Force | Out-Null
+    SHELL
+    
+    # Provisioning 3 - Attendre le DC
+    fs.vm.provision "shell", name: "wait-for-dc", inline: <<-SHELL
+      Write-Host "`n=== Vérification du contrôleur de domaine ===" -ForegroundColor Cyan
+      
+      $timeout = 300
+      $elapsed = 0
+      $dcReady = $false
+      
+      while ($elapsed -lt $timeout -and -not $dcReady) {
+        try {
+          # Test ping
+          $pingResult = Test-Connection -ComputerName "#{NETWORK}.10" -Count 1 -Quiet
+          
+          if ($pingResult) {
+            # Test résolution DNS
+            $dnsResult = Resolve-DnsName -Name "#{DOMAIN}" -ErrorAction SilentlyContinue
+            
+            if ($dnsResult) {
+              Write-Host "Contrôleur de domaine accessible et opérationnel!" -ForegroundColor Green
+              $dcReady = $true
+              break
+            }
+          }
+        } catch {
+          # Ignorer les erreurs et continuer
+        }
+        
+        Write-Host "Attente du contrôleur de domaine... ($elapsed/$timeout secondes)" -ForegroundColor Yellow
+        Start-Sleep -Seconds 10
+        $elapsed += 10
+      }
+      
+      if (-not $dcReady) {
+        Write-Host "ATTENTION: Le contrôleur de domaine n'est pas accessible!" -ForegroundColor Red
+        Write-Host "Veuillez vérifier que SRV-DC1 est démarré et opérationnel." -ForegroundColor Red
+      }
+    SHELL
+    
+    # Provisioning 4 - Copie des scripts
+    fs.vm.provision "file", source: "./scripts/partage&quota.ps1", destination: "C:/scripts/partage&quota.ps1"
+    fs.vm.provision "file", source: "./scripts/config_wsus.ps1", destination: "C:/scripts/config_wsus.ps1"
+    fs.vm.provision "file", source: "./scripts/wsu&wds.ps1", destination: "C:/scripts/wsu&wds.ps1"
+    fs.vm.provision "file", source: "./scripts/wds_&_mdt.ps1", destination: "C:/scripts/wds_&_mdt.ps1"
+    fs.vm.provision "file", source: "./scripts/link.ps1", destination: "C:/scripts/link.ps1"
+    
+    # Provisioning 5 - Jonction au domaine
+    fs.vm.provision "shell", name: "join-domain", privileged: true, inline: <<-SHELL
+      Write-Host "`n=== Jonction au domaine ===" -ForegroundColor Cyan
+      
+      $password = ConvertTo-SecureString "#{ADMIN_PASSWORD}" -AsPlainText -Force
+      $credential = New-Object System.Management.Automation.PSCredential ("#{DOMAIN}\Administrator", $password)
+
+      
+      try {
+        Add-Computer -DomainName "#{DOMAIN}" -Credential $credential -Force -ErrorAction Stop
+        Write-Host "Serveur joint au domaine avec succès!" -ForegroundColor Green
+        Write-Host "Redémarrage nécessaire..." -ForegroundColor Yellow
+      } catch {
+        Write-Host "Erreur lors de la jonction au domaine: $_" -ForegroundColor Red
+        Write-Host "Vérifiez que SRV-DC1 est opérationnel et accessible" -ForegroundColor Yellow
+        throw
+      }
+    SHELL
+    
+    # Provisioning 6 - Redémarrage après jonction
+    fs.vm.provision "shell", name: "reboot-after-join", inline: <<-SHELL
+      Write-Host "Le serveur doit redemarrer. Utilisez 'vagrant reload srv-fs1' puis 'vagrant provision srv-fs1'" -ForegroundColor Yellow
+    SHELL
+    
+    # Provisioning 7 - Installation des rôles (exécuté après reload manuel)
+    fs.vm.provision "shell", name: "install-roles", run: "never", privileged: true, inline: <<-SHELL
+      Write-Host "`n========================================" -ForegroundColor Magenta
+      Write-Host "  INSTALLATION DES RÔLES SERVEUR" -ForegroundColor Magenta
+      Write-Host "========================================`n" -ForegroundColor Magenta
+      
+      # Attendre que le système soit stable
+      Start-Sleep -Seconds 30
+      
+      Write-Host "Installation de FSRM..." -ForegroundColor Cyan
+      Install-WindowsFeature -Name FS-Resource-Manager -IncludeManagementTools
+      
+      Write-Host "Installation de WSUS..." -ForegroundColor Cyan
+      Install-WindowsFeature -Name UpdateServices -IncludeManagementTools
+      Install-WindowsFeature -Name UpdateServices-WidDB
+      Install-WindowsFeature -Name UpdateServices-Services
+      
+      Write-Host "Installation de WDS..." -ForegroundColor Cyan
+      Install-WindowsFeature -Name WDS -IncludeManagementTools
+      
+      Write-Host "Rôles installés avec succès!" -ForegroundColor Green
+    SHELL
+    
+    # Provisioning 8 - Configuration des services (exécuté après reload manuel)
+    fs.vm.provision "shell", name: "configure-services", run: "never", privileged: true, inline: <<-SHELL
+      Write-Host "`n========================================" -ForegroundColor Magenta
+      Write-Host "  CONFIGURATION DES SERVICES" -ForegroundColor Magenta
+      Write-Host "========================================`n" -ForegroundColor Magenta
+      
+      # Attendre que les services soient prêts
+      Start-Sleep -Seconds 20
+      
+      # Exécuter les scripts de configuration
+      $scripts = @(
+        "partage&quota.ps1",
+        "config_wsus.ps1",
+        "wsu&wds.ps1",
+        "wds_&_mdt.ps1",
+        "link.ps1"
+      )
+      
+      foreach ($script in $scripts) {
+        $scriptPath = "C:/scripts/$script"
+        if (Test-Path $scriptPath) {
+          Write-Host "`nExécution de $script..." -ForegroundColor Cyan
+          try {
+            Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+            & $scriptPath
+            Write-Host "$script terminé avec succès!" -ForegroundColor Green
+          } catch {
+            Write-Host "Erreur lors de l'exécution de $script : $_" -ForegroundColor Yellow
+            Write-Host "Détails: $_" -ForegroundColor Yellow
+          }
+        } else {
+          Write-Host "ATTENTION: $scriptPath introuvable" -ForegroundColor Yellow
+        }
+      }
+      
+      Write-Host "`n========================================" -ForegroundColor Green
+      Write-Host "  SRV-FS1 CONFIGURATION TERMINÉE" -ForegroundColor Green
+      Write-Host "========================================`n" -ForegroundColor Green
+      Write-Host "IP: #{NETWORK}.20" -ForegroundColor Cyan
+      Write-Host "Services: FSRM, WSUS, WDS, MDT" -ForegroundColor Cyan
+      Write-Host "WSUS: http://#{NETWORK}.20:8530" -ForegroundColor Cyan
+    SHELL
+  end
+
+  # ========================================
+  # CLIENT-WIN11 - Poste client
+  # ========================================
+  config.vm.define "client-win11", autostart: false do |client|
+    # Box plus stable pour Windows 11
+    client.vm.box = "StefanScherer/windows_11"
+    client.vm.hostname = "CLIENT-WIN11"
+    
+    # Configuration réseau - IP statique au lieu de DHCP
+    client.vm.network "private_network", ip: "#{NETWORK}.100", netmask: "255.255.255.0"
+    
+    # Configuration VirtualBox
+    client.vm.provider "virtualbox" do |vb|
+      vb.name = "CLIENT-WIN11"
+      vb.memory = 4096
+      vb.cpus = 2
+      vb.gui = true
+      vb.linked_clone = true
+      vb.customize ["modifyvm", :id, "--vram", "128"]
+      vb.customize ["modifyvm", :id, "--clipboard", "bidirectional"]
+      vb.customize ["modifyvm", :id, "--draganddrop", "bidirectional"]
+    end
+    
+    # Configuration réseau et DNS
+    client.vm.provision "shell", inline: <<-SHELL
+      Write-Host "Configuration du client Windows 11..." -ForegroundColor Cyan
+      
+      # Désactiver le pare-feu
+      Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+      
+      # Configurer DNS vers le DC
+      $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+      if ($adapter) {
+        # Supprimer les DNS existants
+        Set-DnsClientServerAddress -InterfaceAlias $adapter.Name -ResetServerAddresses
+        # Configurer le DNS du DC
+        Set-DnsClientServerAddress -InterfaceAlias $adapter.Name -ServerAddresses ("#{NETWORK}.10")
+        Write-Host "DNS configure vers #{NETWORK}.10" -ForegroundColor Green
+      }
+      
+      # Configurer la passerelle si nécessaire
+      $gateway = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue
+      if (-not $gateway) {
+        New-NetRoute -InterfaceAlias $adapter.Name -DestinationPrefix "0.0.0.0/0" -NextHop "#{NETWORK}.1" -ErrorAction SilentlyContinue
+      }
+      
+      Write-Host @"
+      
+╔═══════════════════════════════════════════════════════════════════╗
+║                    CLIENT WINDOWS 11 PRÊT                         ║
+╠═══════════════════════════════════════════════════════════════════╣
+║                                                                   ║
+║  Configuration réseau :                                          ║
+║  - IP : #{NETWORK}.100                                             ║
+║  - DNS : #{NETWORK}.10 (SRV-DC1)                                   ║
+║                                                                   ║
+║  Pour joindre le domaine manuellement :                          ║
+║                                                                   ║
+║  1. Paramètres > Système > Informations système                 ║
+║  2. Renommer ce PC (avancé) > Modifier                           ║
+║  3. Domaine: #{DOMAIN}                             ║
+║  4. Utilisateur: Administrateur                                  ║
+║  5. Mot de passe: #{ADMIN_PASSWORD}                                   ║
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝
+"@ -ForegroundColor Cyan
+    SHELL
+  end
+end
